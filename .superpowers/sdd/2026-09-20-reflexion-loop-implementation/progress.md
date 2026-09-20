@@ -24,9 +24,15 @@
 
 ## Progress
 
-- [x] Phase 1 — Core schema & config
-- [ ] Phase 2 — Reflexion engine (reflexion.rs)
-- [ ] Phase 3 — Self-verification gate
+- [x] Phase 1 — Core schema & config — COMPLETE
+  - `9e039e00` firstpass-core changes (spec ✅, 149 tests)
+  - `e5ef5a1` fix: proxy struct literal None defaults (C1 addressed, 782 tests)
+  - Review clean after fix round 1/5
+- [x] Phase 2 — Reflexion engine (reflexion.rs) — COMPLETE
+  - `a1665c2` reflexion.rs (13 tests)
+  - `d941faa` fix: SHA-256 pinned, context isolation assertions, convergence prev_output (14 tests)
+  - Re-review clean (B1/B2/B3 ADDRESSED, 438 tests workspace)
+- [x] Phase 3 — Self-verification gate — COMPLETE
 - [ ] Phase 4 — Router & proxy integration
 - [ ] Phase 5 — Bandit improvements
 - [ ] Phase 6 — Final verification

@@ -40,9 +40,9 @@ pub mod verdict;
 
 pub use config::{
     AbstainPolicy, AuthScheme, BanditAlgorithm, BanditConfig, Budget, Config, ConsistencyDef,
-    Dialect, Escalation, GateDef, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
+    Dialect, Escalation, GateDef, GateKind, JudgeDef, Mode, ModePreset, ModelRef, OnExhausted,
     PredictorConfig, PriceDef, ProbeConfig, ProviderDef, ReflexionConfig, ReflexionExhaustedPolicy,
-    Route, RoutingMode, SessionPromotion,
+    Route, RoutingMode, SelfVerifyDef, SessionPromotion,
 };
 pub use conformal::{ConformalResult, calibrate, served_failure_rate};
 pub use cost::{ModelPrice, PriceTable};

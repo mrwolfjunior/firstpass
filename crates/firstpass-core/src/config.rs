@@ -284,27 +284,29 @@ pub struct PriceDef {
 ///   candidate by agreement with k fresh samples of the same model (Wang et al. 2022).
 /// - **schema** (`schema`): validates the candidate (parsed as JSON) against a JSON-Schema
 ///   subset (top-level `type` / `required` / per-property `type`).
+/// - **self_verify** (`kind = "self_verify"` or `self_verify`): asks the executor model
+///   to rate its own output confidence (AutoMix / Self-REF pattern, SPEC §10.8).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateDef {
     /// The id a route references this gate by (must be unique and not shadow a built-in gate id).
     pub id: String,
     /// Subprocess command: program first, then its args — e.g. `["pytest", "-q"]`. Set this **or**
-    /// `judge` / `consistency` / `schema`, not both.
+    /// `judge` / `consistency` / `schema` / `self_verify`, not both.
     #[serde(default)]
     pub cmd: Vec<String>,
     /// Hard timeout in milliseconds for a subprocess gate; it abstains (`timeout`) if the process
     /// runs longer.
     #[serde(default = "default_gate_timeout_ms")]
     pub timeout_ms: u64,
-    /// LLM-judge configuration. Set this **or** `cmd` / `consistency` / `schema`, not both.
+    /// LLM-judge configuration. Set this **or** `cmd` / `consistency` / `schema` / `self_verify`, not both.
     #[serde(default)]
     pub judge: Option<JudgeDef>,
-    /// Self-consistency configuration. Set this **or** `cmd` / `judge` / `schema`, not both.
+    /// Self-consistency configuration. Set this **or** `cmd` / `judge` / `schema` / `self_verify`, not both.
     #[serde(default)]
     pub consistency: Option<ConsistencyDef>,
     /// JSON-Schema (subset) the candidate must satisfy. Set this **or** `cmd` / `judge` /
-    /// `consistency`, not both.
+    /// `consistency` / `self_verify`, not both.
     #[serde(default)]
     pub schema: Option<serde_json::Value>,
     /// What an **abstain** from this gate means for serving (§7.2). `fail_open` (default): an
@@ -313,6 +315,101 @@ pub struct GateDef {
     /// availability, for gates whose silence must never be mistaken for approval.
     #[serde(default)]
     pub on_abstain: AbstainPolicy,
+    /// Explicit gate kind (e.g. `"self_verify"`).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Response value that counts as passing for a self-verify gate (e.g. `"high"`).
+    #[serde(default)]
+    pub pass_when: Option<String>,
+    /// Custom verification prompt for a self-verify gate.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Self-verify gate configuration section.
+    #[serde(default)]
+    pub self_verify: Option<SelfVerifyDef>,
+}
+
+impl Default for GateDef {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            cmd: Vec::new(),
+            timeout_ms: default_gate_timeout_ms(),
+            judge: None,
+            consistency: None,
+            schema: None,
+            on_abstain: AbstainPolicy::default(),
+            kind: None,
+            pass_when: None,
+            prompt: None,
+            self_verify: None,
+        }
+    }
+}
+
+impl GateDef {
+    /// Return the resolved [`GateKind`] for this definition, if valid.
+    #[must_use]
+    pub fn kind(&self) -> Option<GateKind> {
+        if let Some(sv) = &self.self_verify {
+            return Some(GateKind::SelfVerify {
+                pass_when: sv.pass_when.clone(),
+                prompt: sv.prompt.clone(),
+            });
+        }
+        if self.kind.as_deref() == Some("self_verify") {
+            return Some(GateKind::SelfVerify {
+                pass_when: self.pass_when.clone().unwrap_or_else(default_pass_when),
+                prompt: self.prompt.clone(),
+            });
+        }
+        if let Some(j) = &self.judge {
+            return Some(GateKind::Judge(j.clone()));
+        }
+        if let Some(c) = &self.consistency {
+            return Some(GateKind::Consistency(c.clone()));
+        }
+        if let Some(s) = &self.schema {
+            return Some(GateKind::Schema(s.clone()));
+        }
+        if !self.cmd.is_empty() {
+            return Some(GateKind::Subprocess(self.cmd.clone()));
+        }
+        None
+    }
+}
+
+/// Kinds of user-defined gates.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    Subprocess(Vec<String>),
+    Judge(JudgeDef),
+    Consistency(ConsistencyDef),
+    Schema(serde_json::Value),
+    SelfVerify {
+        pass_when: String,
+        prompt: Option<String>,
+    },
+}
+
+/// Configuration for a self-verification gate (AutoMix / Self-REF pattern, SPEC §10.8):
+/// asks the executor model that produced the response to rate its own output quality.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfVerifyDef {
+    /// The response value that counts as passing (e.g. `"high"`).
+    #[serde(default = "default_pass_when")]
+    pub pass_when: String,
+    /// Custom verification prompt. `None` uses the default confidence prompt.
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// Default response that counts as passing for a self-verify gate: `"high"`.
+#[must_use]
+pub fn default_pass_when() -> String {
+    "high".to_owned()
 }
 
 /// Per-gate abstain policy (§7.2): what happens to serving when the gate can't produce a verdict.
@@ -329,7 +426,7 @@ pub enum AbstainPolicy {
 /// Configuration for a native LLM-judge gate (SPEC §8.3): a separate model grades the candidate
 /// against a rubric. The runner enforces maker ≠ checker (a model never grades its own output) and
 /// treats the candidate as data, not instructions.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeDef {
     /// The judge model, as `provider/model` (must differ from the candidate's model at runtime).
@@ -352,7 +449,7 @@ pub struct JudgeDef {
 ///
 /// **maker == checker is intentional** — unlike a judge gate, self-consistency is definitionally
 /// self-referential. This is the mechanism, not a bug.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsistencyDef {
     /// The model used for resampling, as `provider/model`. May equal the candidate's model —
@@ -1165,21 +1262,56 @@ impl Config {
             if def.id.trim().is_empty() {
                 return Err(Error::InvalidConfig("gate id must not be empty".to_owned()));
             }
-            // Exactly one kind: `cmd`, `judge`, `consistency`, or `schema` — never more, never none.
+            let is_self_verify =
+                def.self_verify.is_some() || def.kind.as_deref() == Some("self_verify");
+            // Exactly one kind: `cmd`, `judge`, `consistency`, `schema`, or `self_verify` — never more, never none.
             let kinds_set = [
                 !def.cmd.is_empty(),
                 def.judge.is_some(),
                 def.consistency.is_some(),
                 def.schema.is_some(),
+                is_self_verify,
             ]
             .iter()
             .filter(|&&b| b)
             .count();
             if kinds_set != 1 {
                 return Err(Error::InvalidConfig(format!(
-                    "gate {:?} must set exactly one of `cmd`, `judge`, `consistency`, or `schema`",
+                    "gate {:?} must set exactly one of `cmd`, `judge`, `consistency`, `schema`, or `self_verify`",
                     def.id
                 )));
+            }
+            if let Some(k) = &def.kind
+                && k != "self_verify"
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "gate {:?} has unknown kind {:?}",
+                    def.id, k
+                )));
+            }
+            if !is_self_verify && (def.pass_when.is_some() || def.prompt.is_some()) {
+                return Err(Error::InvalidConfig(format!(
+                    "gate {:?} sets `pass_when` or `prompt` but is not a `self_verify` gate",
+                    def.id
+                )));
+            }
+            if is_self_verify {
+                if let Some(sv) = &def.self_verify
+                    && sv.pass_when.trim().is_empty()
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} self_verify pass_when must not be empty",
+                        def.id
+                    )));
+                }
+                if let Some(pw) = &def.pass_when
+                    && pw.trim().is_empty()
+                {
+                    return Err(Error::InvalidConfig(format!(
+                        "gate {:?} self_verify pass_when must not be empty",
+                        def.id
+                    )));
+                }
             }
             if let Some(judge) = &def.judge
                 && !(0.0..=1.0).contains(&judge.threshold)
@@ -2300,5 +2432,110 @@ discount = 0.98
                 "invalid top-level reflexion config accepted: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn parses_self_verify_gate_definition() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates = ["self-verify"]
+
+[[gate]]
+id = "self-verify"
+kind = "self_verify"
+pass_when = "high"
+prompt = "Rate your confidence in the above response: high / medium / low. Answer only the rating."
+"#;
+        let c = Config::parse(toml).expect("self-verify gate config must parse");
+        assert_eq!(c.gate_defs.len(), 1);
+        let def = &c.gate_defs[0];
+        assert_eq!(def.id, "self-verify");
+        assert_eq!(def.kind.as_deref(), Some("self_verify"));
+        assert_eq!(def.pass_when.as_deref(), Some("high"));
+        assert_eq!(
+            def.prompt.as_deref(),
+            Some(
+                "Rate your confidence in the above response: high / medium / low. Answer only the rating."
+            )
+        );
+        assert_eq!(
+            def.kind(),
+            Some(GateKind::SelfVerify {
+                pass_when: "high".to_owned(),
+                prompt: Some(
+                    "Rate your confidence in the above response: high / medium / low. Answer only the rating."
+                        .to_owned()
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_self_verify_gate_defaults() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "self-verify"
+kind = "self_verify"
+"#;
+        let c = Config::parse(toml).expect("self-verify gate with defaults must parse");
+        assert_eq!(
+            c.gate_defs[0].kind(),
+            Some(GateKind::SelfVerify {
+                pass_when: "high".to_owned(),
+                prompt: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_self_verify_gate_table_syntax() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+
+[[gate]]
+id = "self-verify"
+self_verify = { pass_when = "yes", prompt = "Is this correct?" }
+"#;
+        let c = Config::parse(toml).expect("self-verify table syntax must parse");
+        assert_eq!(
+            c.gate_defs[0].kind(),
+            Some(GateKind::SelfVerify {
+                pass_when: "yes".to_owned(),
+                prompt: Some("Is this correct?".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_self_verify_violations() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
+        // cmd + kind = self_verify (two kinds)
+        let both = format!("{base}[[gate]]\nid = \"g\"\ncmd = [\"x\"]\nkind = \"self_verify\"\n");
+        assert!(Config::parse(&both).is_err());
+
+        // empty pass_when
+        let empty_pw =
+            format!("{base}[[gate]]\nid = \"g\"\nkind = \"self_verify\"\npass_when = \"  \"\n");
+        assert!(Config::parse(&empty_pw).is_err());
+
+        // unknown kind
+        let unknown_kind = format!("{base}[[gate]]\nid = \"g\"\nkind = \"unknown_kind\"\n");
+        assert!(Config::parse(&unknown_kind).is_err());
+
+        // pass_when on non-self_verify gate
+        let pw_on_cmd =
+            format!("{base}[[gate]]\nid = \"g\"\ncmd = [\"true\"]\npass_when = \"high\"\n");
+        assert!(Config::parse(&pw_on_cmd).is_err());
     }
 }

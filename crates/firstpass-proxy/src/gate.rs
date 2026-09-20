@@ -9,10 +9,10 @@
 
 use crate::consistency::ConsistencyGate;
 use crate::judge::JudgeGate;
-use crate::provider::{Auth, ModelRequest, ModelResponse, ProviderRegistry};
+use crate::provider::{Auth, ChatMessage, ModelRequest, ModelResponse, ProviderRegistry};
 use crate::subprocess::SubprocessGate;
 use async_trait::async_trait;
-use firstpass_core::{AbstainPolicy, GateDef, GateResult, Verdict, cost::PriceTable};
+use firstpass_core::{AbstainPolicy, GateDef, GateKind, GateResult, Verdict, cost::PriceTable};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -144,6 +144,144 @@ impl Gate for SchemaGate {
             Some(reason) => {
                 let mut r = GateResult::deterministic(self.id(), Verdict::Fail, 0);
                 r.reason = Some(reason);
+                r
+            }
+        }
+    }
+}
+
+/// Default user prompt for self-verification confidence check.
+pub const DEFAULT_SELF_VERIFY_PROMPT: &str = "Rate your confidence in the above response.";
+
+/// Pinned system prompt for self-verification.
+pub const SELF_VERIFY_SYSTEM_PROMPT: &str = "Answer only with a single word: high, medium, or low.";
+
+/// Self-verification gate (AutoMix / Self-REF pattern, SPEC §10.8):
+/// asks the executor model that produced the response to rate its own output quality.
+#[derive(Debug, Clone)]
+pub struct SelfVerifyGate {
+    id: String,
+    pass_when: String,
+    prompt: Option<String>,
+    registry: ProviderRegistry,
+    auth: Auth,
+    prices: PriceTable,
+}
+
+impl SelfVerifyGate {
+    /// Create a new self-verification gate.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        pass_when: impl Into<String>,
+        prompt: Option<String>,
+        registry: ProviderRegistry,
+        auth: Auth,
+        prices: PriceTable,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            pass_when: pass_when.into(),
+            prompt,
+            registry,
+            auth,
+            prices,
+        }
+    }
+
+    /// The gate id.
+    #[must_use]
+    pub fn id_str(&self) -> &str {
+        &self.id
+    }
+
+    /// The expected passing response value.
+    #[must_use]
+    pub fn pass_when(&self) -> &str {
+        &self.pass_when
+    }
+
+    /// The custom verification prompt, if any.
+    #[must_use]
+    pub fn prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
+    }
+}
+
+#[async_trait]
+impl Gate for SelfVerifyGate {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn evaluate(&self, req: &ModelRequest, resp: &ModelResponse) -> GateResult {
+        let provider_id = req.model.split('/').next().unwrap_or(&req.model);
+        let provider = self
+            .registry
+            .get(provider_id)
+            .or_else(|| self.registry.get(&req.model));
+
+        let Some(provider) = provider else {
+            let mut r = GateResult::abstain(&self.id, "unknown_provider", 0);
+            r.evidence_ref = Some(format!(
+                "provider `{provider_id}` for model `{}` not found in registry",
+                req.model
+            ));
+            return r;
+        };
+
+        let prompt_text = self.prompt.as_deref().unwrap_or(DEFAULT_SELF_VERIFY_PROMPT);
+        let user_content = if resp.text.is_empty() {
+            prompt_text.to_owned()
+        } else {
+            format!("{}\n\n{}", resp.text, prompt_text)
+        };
+
+        let verify_req = ModelRequest {
+            model: req.model.clone(),
+            system: Some(SELF_VERIFY_SYSTEM_PROMPT.to_owned()),
+            messages: vec![ChatMessage::text("user", user_content)],
+            max_tokens: 15,
+            tools: serde_json::Value::Null,
+            raw: serde_json::Value::Null,
+            cache_prefix: false,
+        };
+
+        let start = std::time::Instant::now();
+        match provider.complete(&verify_req, &self.auth).await {
+            Ok(verification) => {
+                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let trimmed_text = verification.text.trim();
+                let pass_target = self.pass_when.trim();
+                let passed = trimmed_text
+                    .to_lowercase()
+                    .contains(&pass_target.to_lowercase());
+                let verdict = if passed { Verdict::Pass } else { Verdict::Fail };
+                let mut r = GateResult::deterministic(&self.id, verdict, elapsed_ms);
+                let reason = if passed {
+                    format!("self-verify passed: response contained {pass_target:?}")
+                } else {
+                    format!(
+                        "self-verify failed: response {trimmed_text:?} did not contain {pass_target:?}"
+                    )
+                };
+                r.reason = Some(reason);
+                r.cost_usd = self
+                    .prices
+                    .cost_usd_with_cache(
+                        &req.model,
+                        verification.in_tokens,
+                        verification.cache_write_tokens,
+                        verification.cache_read_tokens,
+                        verification.out_tokens,
+                    )
+                    .unwrap_or(0.0);
+                r
+            }
+            Err(e) => {
+                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let mut r = GateResult::abstain(&self.id, "self_verify_error", elapsed_ms);
+                r.evidence_ref = Some(e.to_string());
                 r
             }
         }
@@ -323,9 +461,21 @@ pub fn resolve_gates(
             "non-empty" => push(Box::new(NonEmptyGate), None),
             "json-valid" => push(Box::new(JsonValidGate), None),
             other => match defs.iter().find(|d| d.id == other) {
-                Some(def) if def.judge.is_some() => {
-                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
-                    if let Some(judge) = def.judge.as_ref() {
+                Some(def) => match def.kind() {
+                    Some(GateKind::SelfVerify { pass_when, prompt }) => {
+                        push(
+                            Box::new(SelfVerifyGate::new(
+                                def.id.clone(),
+                                pass_when,
+                                prompt,
+                                registry.clone(),
+                                auth.clone(),
+                                prices.clone(),
+                            )),
+                            Some(def),
+                        );
+                    }
+                    Some(GateKind::Judge(judge)) => {
                         let provider_id = judge.model.split('/').next().unwrap_or_default();
                         match registry.get(provider_id) {
                             Some(provider) => push(
@@ -346,10 +496,7 @@ pub fn resolve_gates(
                             ),
                         }
                     }
-                }
-                Some(def) if def.consistency.is_some() => {
-                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
-                    if let Some(cons) = def.consistency.as_ref() {
+                    Some(GateKind::Consistency(cons)) => {
                         let provider_id = cons.model.split('/').next().unwrap_or_default();
                         match registry.get(provider_id) {
                             Some(provider) => push(
@@ -370,31 +517,31 @@ pub fn resolve_gates(
                             ),
                         }
                     }
-                }
-                Some(def) if def.schema.is_some() => {
-                    // `Config::parse` guarantees exactly one kind, so this `if let` always binds.
-                    if let Some(schema) = def.schema.as_ref() {
+                    Some(GateKind::Schema(schema)) => {
+                        push(Box::new(SchemaGate::new(def.id.clone(), schema)), Some(def));
+                    }
+                    Some(GateKind::Subprocess(cmd)) => {
+                        let Some((program, args)) = cmd.split_first() else {
+                            tracing::warn!(gate = %other, "configured gate has empty cmd — skipped");
+                            continue;
+                        };
                         push(
-                            Box::new(SchemaGate::new(def.id.clone(), schema.clone())),
+                            Box::new(SubprocessGate::new(
+                                def.id.clone(),
+                                program.clone(),
+                                args.to_vec(),
+                                Duration::from_millis(def.timeout_ms),
+                            )),
                             Some(def),
                         );
                     }
-                }
-                Some(def) => {
-                    let Some((program, args)) = def.cmd.split_first() else {
-                        tracing::warn!(gate = %other, "configured gate has empty cmd — skipped");
-                        continue;
-                    };
-                    push(
-                        Box::new(SubprocessGate::new(
-                            def.id.clone(),
-                            program.clone(),
-                            args.to_vec(),
-                            Duration::from_millis(def.timeout_ms),
-                        )),
-                        Some(def),
-                    );
-                }
+                    None => {
+                        tracing::warn!(
+                            gate = %other,
+                            "configured gate has no recognized kind — skipped"
+                        );
+                    }
+                },
                 None => tracing::warn!(
                     gate = %other,
                     "unknown gate id — not a built-in and not defined in [[gate]]; skipped"
@@ -557,6 +704,7 @@ mod tests {
             consistency: None,
             schema: None,
             on_abstain: AbstainPolicy::FailOpen,
+            ..Default::default()
         }];
         let gates = resolve_gates(
             &["my-tests".to_owned(), "undefined".to_owned()],
@@ -586,6 +734,7 @@ mod tests {
             consistency: None,
             schema: None,
             on_abstain: AbstainPolicy::FailOpen,
+            ..Default::default()
         }];
         let gates = resolve_gates(
             &["no-bad".to_owned()],
@@ -619,6 +768,7 @@ mod tests {
             consistency: None,
             schema: None,
             on_abstain: AbstainPolicy::FailOpen,
+            ..Default::default()
         }];
 
         // Registry that serves `anthropic` → the judge gate is built.
@@ -671,6 +821,7 @@ mod tests {
             }),
             schema: None,
             on_abstain: AbstainPolicy::FailOpen,
+            ..Default::default()
         }];
 
         // Registry that serves `anthropic` → the consistency gate is built.
@@ -786,6 +937,7 @@ mod tests {
             consistency: None,
             schema: Some(json!({"type": "object", "required": ["name"]})),
             on_abstain: firstpass_core::AbstainPolicy::FailOpen,
+            ..Default::default()
         }];
         let gates = resolve_gates(
             &["extract-shape".to_owned()],
@@ -816,6 +968,7 @@ mod tests {
                 consistency: None,
                 schema: None,
                 on_abstain,
+                ..Default::default()
             }]
         };
         let open = resolve_gates(
@@ -856,5 +1009,154 @@ mod tests {
             aggregate_with_policy(&[pass, abstain], &closed),
             Verdict::Fail
         );
+    }
+
+    #[test]
+    fn self_verify_gate_config_parses() {
+        let toml = r#"
+[[route]]
+match = {}
+mode = "enforce"
+ladder = ["anthropic/claude-haiku-4-5"]
+gates = ["self-verify"]
+
+[[gate]]
+id = "self-verify"
+kind = "self_verify"
+pass_when = "high"
+prompt = "Rate your confidence in the above response: high / medium / low. Answer only the rating."
+"#;
+        let config =
+            firstpass_core::Config::parse(toml).expect("config with self_verify gate must parse");
+        assert_eq!(config.gate_defs.len(), 1);
+        let def = &config.gate_defs[0];
+        assert_eq!(def.id, "self-verify");
+        assert_eq!(def.kind.as_deref(), Some("self_verify"));
+        assert_eq!(def.pass_when.as_deref(), Some("high"));
+        assert!(def.prompt.is_some());
+
+        let gates = resolve_gates(
+            &["self-verify".to_owned()],
+            &config.gate_defs,
+            &empty_registry(),
+            &Auth::default(),
+            &PriceTable::default(),
+        );
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].id(), "self-verify");
+    }
+
+    #[tokio::test]
+    async fn self_verify_passes_on_matching_response() {
+        use crate::provider::{MockProvider, Provider};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert("anthropic/claude-haiku-4-5".to_owned(), Ok(resp("high")));
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outcomes)),
+        );
+        let registry = ProviderRegistry::from_map(map);
+
+        let gate = SelfVerifyGate::new(
+            "self-verify",
+            "high",
+            None,
+            registry,
+            Auth::default(),
+            PriceTable::default(),
+        );
+
+        let result = gate.evaluate(&req(), &resp("candidate text")).await;
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("passed")
+        );
+    }
+
+    #[tokio::test]
+    async fn self_verify_fails_on_non_matching_response() {
+        use crate::provider::{MockProvider, Provider};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert("anthropic/claude-haiku-4-5".to_owned(), Ok(resp("low")));
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outcomes)),
+        );
+        let registry = ProviderRegistry::from_map(map);
+
+        let gate = SelfVerifyGate::new(
+            "self-verify",
+            "high",
+            None,
+            registry,
+            Auth::default(),
+            PriceTable::default(),
+        );
+
+        let result = gate.evaluate(&req(), &resp("candidate text")).await;
+        assert_eq!(result.verdict, Verdict::Fail);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn self_verify_fails_on_medium() {
+        use crate::provider::{MockProvider, Provider};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut outcomes = HashMap::new();
+        outcomes.insert("anthropic/claude-haiku-4-5".to_owned(), Ok(resp("medium")));
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockProvider::new("anthropic", outcomes)),
+        );
+        let registry = ProviderRegistry::from_map(map);
+
+        let gate = SelfVerifyGate::new(
+            "self-verify",
+            "high",
+            None,
+            registry,
+            Auth::default(),
+            PriceTable::default(),
+        );
+
+        let result = gate.evaluate(&req(), &resp("candidate text")).await;
+        assert_eq!(result.verdict, Verdict::Fail);
+    }
+
+    #[tokio::test]
+    async fn self_verify_abstains_on_missing_provider() {
+        let gate = SelfVerifyGate::new(
+            "self-verify",
+            "high",
+            None,
+            empty_registry(),
+            Auth::default(),
+            PriceTable::default(),
+        );
+        let mut request = req();
+        request.model = "unknown/model".to_owned();
+        let result = gate.evaluate(&request, &resp("test")).await;
+        assert_eq!(result.verdict, Verdict::Abstain);
     }
 }
