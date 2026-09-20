@@ -70,6 +70,14 @@ gates  = ["non-empty", "judge"]
 # routing_mode = "quality"   # optional per-route preset (observe|cost|balanced|quality|latency|max)
 
 [[route]]
+match = { task_kind = "code_generation" }
+mode  = "enforce"
+ladder = ["ollama/llama-3.3-30b", "openai/gpt-4o"]
+gates  = ["self-verify", "unit-tests"]
+# A mentor-guided reflexion loop: a larger mentor diagnoses failure and prompts the executor to fix it
+reflexion = { mentor_model = "ollama/llama-3.3-80b", max_reflections = 3, mentor_max_out_tokens = 200 }
+
+[[route]]
 match = { task_kind = "code_edit" }
 mode  = "enforce"
 ladder = ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4-8"]
@@ -96,6 +104,13 @@ cmd = ["your-test-runner", "--from-stdin"]
 [[gate]]
 id    = "judge"
 judge = { model = "anthropic/claude-opus-4-8", threshold = 0.7, rubric = "The response fully and correctly resolves the request, with no errors." }
+
+# A self-verification gate (AutoMix / Self-REF): asks the model to rate its own confidence.
+# The gate makes a fast (max_tokens: 15) call to the SAME model that generated the attempt.
+# If the output contains the `pass_when` string (case-insensitive), it passes.
+[[gate]]
+id = "self-verify"
+self_verify = { pass_when = "high" }
 
 # A self-consistency uncertainty gate (Wang et al. 2022; Farquhar et al., Nature 2024): call the
 # same model k times and score the candidate by agreement with the fresh samples. Pass iff the

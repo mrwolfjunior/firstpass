@@ -63,9 +63,10 @@ ones that qualify them.
 <div align="center"><img src="assets/how.svg" alt="Four moves: 1 Route — open the cheapest rung of the ladder. 2 Prove — gate the real output with tests, a schema, or a judge. 3 Escalate — one rung up only on gate failure, budget-capped. 4 Learn — outcomes feed back so the serve threshold self-tunes. Learn loops back to Route." width="900"></div>
 
 1. **Route** — every request opens on the cheapest rung of your model ladder. No per-prompt classifier picks the model; the cheap model simply takes the first pass.
-2. **Prove** — a *gate* checks the actual output: your unit tests, a JSON schema, an LLM judge (maker ≠ checker), or self-consistency. It reads the real answer, not the prompt.
-3. **Escalate** — only on gate failure: one rung up, budget-capped, with cross-provider failover on a 5xx.
-4. **Learn** — outcomes feed back via `/v1/feedback`; the serve threshold self-tunes so the guarantee tracks your live traffic. **No policy model to retrain, ever.**
+2. **Prove** — a *gate* checks the actual output: your unit tests, a JSON schema, an LLM judge, self-verification, or self-consistency. It reads the real answer, not the prompt.
+3. **Reflect (Optional)** — on gate failure, a larger mentor model can diagnose the error and prompt the executor to fix it iteratively before escalating, leveraging local **Reflexion Loops** for speed and quality.
+4. **Escalate** — only on Reflexion exhaustion or gate failure: one rung up, budget-capped, with cross-provider failover on a 5xx.
+5. **Learn** — outcomes feed back via `/v1/feedback`; the serve threshold self-tunes so the guarantee tracks your live traffic. **No policy model to retrain, ever.**
 
 > **Who decides a request needs the expensive model?** The gate — from the cheap model's *actual answer*. Never a classifier guessing from the prompt. Change what "good" means by editing a gate; there's nothing to retrain.
 
