@@ -175,6 +175,11 @@ fn cache_hit_trace(
             counterfactual_baseline_usd: entry.original_cost_usd,
             savings_usd: entry.original_cost_usd,
             cache_source: Some(entry.source),
+            reflexion_cycles: None,
+            mentor_cost_usd: None,
+            reflexion_cycles_to_pass: None,
+            triggered_by_self_verify: None,
+            reflexion_latency_capped: None,
         },
         deferred: Vec::new(),
         predicted_pass: None,
@@ -2824,6 +2829,9 @@ fn build_trace(
         latency_ms,
         gates: Vec::new(),
         verdict: Verdict::Pass,
+        reflexion_cycle: None,
+        mentor_correction_hash: None,
+        reflexion_converged: None,
     };
 
     let mut trace = base_trace(config, req_body, latency_ms, session_header);
@@ -2841,6 +2849,11 @@ fn build_trace(
         counterfactual_baseline_usd: cost_usd,
         savings_usd: 0.0,
         cache_source: None,
+        reflexion_cycles: None,
+        mentor_cost_usd: None,
+        reflexion_cycles_to_pass: None,
+        triggered_by_self_verify: None,
+        reflexion_latency_capped: None,
     };
     trace.recompute_savings();
     trace
@@ -2871,6 +2884,9 @@ fn build_stream_trace(
         latency_ms,
         gates: Vec::new(),
         verdict: Verdict::Pass,
+        reflexion_cycle: None,
+        mentor_correction_hash: None,
+        reflexion_converged: None,
     };
 
     let mut trace = base_trace(config, req_body, latency_ms, session_header);
@@ -2887,6 +2903,11 @@ fn build_stream_trace(
         counterfactual_baseline_usd: 0.0,
         savings_usd: 0.0,
         cache_source: None,
+        reflexion_cycles: None,
+        mentor_cost_usd: None,
+        reflexion_cycles_to_pass: None,
+        triggered_by_self_verify: None,
+        reflexion_latency_capped: None,
     };
     trace.recompute_savings();
     trace
@@ -2915,6 +2936,11 @@ fn build_error_trace(
         counterfactual_baseline_usd: 0.0,
         savings_usd: 0.0,
         cache_source: None,
+        reflexion_cycles: None,
+        mentor_cost_usd: None,
+        reflexion_cycles_to_pass: None,
+        triggered_by_self_verify: None,
+        reflexion_latency_capped: None,
     };
     trace.recompute_savings();
     trace
@@ -2962,6 +2988,11 @@ fn base_trace(
             counterfactual_baseline_usd: 0.0,
             savings_usd: 0.0,
             cache_source: None,
+            reflexion_cycles: None,
+            mentor_cost_usd: None,
+            reflexion_cycles_to_pass: None,
+            triggered_by_self_verify: None,
+            reflexion_latency_capped: None,
         },
         probe: None,
         rollout: None,
@@ -4597,6 +4628,7 @@ mod tests {
             routing_mode: None,
             rollout: None,
             shadow: None,
+            reflexion: None,
         }
     }
 
@@ -5180,6 +5212,9 @@ mod tests {
             latency_ms: 5,
             gates: vec![],
             verdict: Verdict::Pass,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         });
         let trace_id = trace.trace_id.to_string();
         if served {

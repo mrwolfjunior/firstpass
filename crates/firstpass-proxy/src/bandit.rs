@@ -573,6 +573,9 @@ mod tests {
             latency_ms: 10,
             gates: vec![],
             verdict,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         }
     }
 
@@ -661,6 +664,11 @@ mod tests {
                 counterfactual_baseline_usd: 0.001,
                 savings_usd: 0.0,
                 cache_source: None,
+                reflexion_cycles: None,
+                mentor_cost_usd: None,
+                reflexion_cycles_to_pass: None,
+                triggered_by_self_verify: None,
+                reflexion_latency_capped: None,
             },
             probe: None,
             rollout: None,

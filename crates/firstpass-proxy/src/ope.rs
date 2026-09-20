@@ -766,6 +766,9 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),
@@ -797,6 +800,11 @@ mod tests {
                 counterfactual_baseline_usd: cost_usd,
                 savings_usd: 0.0,
                 cache_source: None,
+                reflexion_cycles: None,
+                mentor_cost_usd: None,
+                reflexion_cycles_to_pass: None,
+                triggered_by_self_verify: None,
+                reflexion_latency_capped: None,
             },
             probe: None,
             rollout: None,
@@ -831,6 +839,9 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict: Verdict::Fail,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         };
         let sonnet = firstpass_core::Attempt {
             rung: 1,
@@ -852,6 +863,9 @@ mod tests {
                 evidence_ref: None,
             }],
             verdict: Verdict::Pass,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         };
         let total = haiku_cost + sonnet_cost;
         let mut trace = Trace {
@@ -884,6 +898,11 @@ mod tests {
                 counterfactual_baseline_usd: total,
                 savings_usd: 0.0,
                 cache_source: None,
+                reflexion_cycles: None,
+                mentor_cost_usd: None,
+                reflexion_cycles_to_pass: None,
+                triggered_by_self_verify: None,
+                reflexion_latency_capped: None,
             },
             probe: None,
             rollout: None,
@@ -1270,6 +1289,9 @@ serve_threshold = 0.75
             latency_ms: 5,
             gates: vec![],
             verdict: Verdict::Pass,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),
@@ -1301,6 +1323,11 @@ serve_threshold = 0.75
                 counterfactual_baseline_usd: cost_usd,
                 savings_usd: 0.0,
                 cache_source: None,
+                reflexion_cycles: None,
+                mentor_cost_usd: None,
+                reflexion_cycles_to_pass: None,
+                triggered_by_self_verify: None,
+                reflexion_latency_capped: None,
             },
             probe: None,
             rollout: None,

@@ -64,3 +64,22 @@ All requested changes were made strictly within `crates/firstpass-core` adhering
 - In `firstpass-proxy`, Phase 2 will introduce `reflexion.rs` containing `ReflexionCtx` and `run_reflexion_loop`.
 - Phase 2 can import `ReflexionConfig` and `ReflexionExhaustedPolicy` directly from `firstpass_core::config::{ReflexionConfig, ReflexionExhaustedPolicy}` (or `firstpass_core::{ReflexionConfig, ReflexionExhaustedPolicy}`).
 - Hash chain integrity remains protected because all new trace fields on `Attempt` and `FinalOutcome` are omitted when `None`.
+
+## Fix Round 1 Report (C1 — Proxy Struct Literals)
+
+- **Issue:** Adding public fields to `Attempt`, `FinalOutcome`, and `Route` broke struct literal instantiations across `crates/firstpass-proxy` (11 library errors, 37 test errors).
+- **Remediation:**
+  - `crates/firstpass-proxy/src/router.rs`: Added `None` for new fields in `FinalOutcome` (`make_outcome_and_trace`), `Attempt` in ladder execution, and `abstain_attempt`.
+  - `crates/firstpass-proxy/src/proxy.rs`: Added `None` for new fields in `FinalOutcome` (cache lookup, `build_observe_trace`, `build_stream_trace`, `build_error_trace`, `base_trace`), `Attempt` (observe trace and mock test trace), and `Route` (`bare_enforce_route`).
+  - `crates/firstpass-proxy/src/bandit.rs`: Added `None` for `Attempt` in `stub_attempt` and `FinalOutcome` in test trace constructor.
+  - `crates/firstpass-proxy/src/calibrate.rs`: Added `None` for `Attempt` and `FinalOutcome` in `trace_with_score`.
+  - `crates/firstpass-proxy/src/cli.rs`: Added `None` for `Attempt` and `FinalOutcome` across export and explain unit tests.
+  - `crates/firstpass-proxy/src/ope.rs`: Added `None` for `Attempt` and `FinalOutcome` in `make_test_trace`, `make_escalated_trace`, and `make_propensity_trace`.
+  - `crates/firstpass-proxy/src/store.rs`: Added `None` for `Attempt` and `FinalOutcome` in test helper `sample_trace`; resolved `while_let_loop` lint in trace writer loop.
+  - `crates/firstpass-proxy/src/verified_cache.rs`: Added `None` for `Attempt` and `FinalOutcome` in test helper.
+
+### Verification Results After Fix
+- `cargo test --workspace`: 782 passed; 0 failed.
+- `cargo clippy --workspace --all-targets -- -D warnings`: Clean, 0 warnings across all workspace crates and test targets.
+- `cargo fmt --all --check`: Clean formatting across the workspace.
+

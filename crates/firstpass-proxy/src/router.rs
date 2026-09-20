@@ -244,6 +244,11 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
             counterfactual_baseline_usd: baseline,
             savings_usd: 0.0,
             cache_source: None,
+            reflexion_cycles: None,
+            mentor_cost_usd: None,
+            reflexion_cycles_to_pass: None,
+            triggered_by_self_verify: None,
+            reflexion_latency_capped: None,
         },
         probe: None,
         rollout: None,
@@ -489,6 +494,9 @@ async fn run_serial(ctx: &EnforceCtx<'_>) -> LadderRun {
                     latency_ms: ms,
                     gates: gate_results,
                     verdict,
+                    reflexion_cycle: None,
+                    mentor_correction_hash: None,
+                    reflexion_converged: None,
                 });
                 best = Some((idx, resp));
 
@@ -688,6 +696,9 @@ async fn run_speculative(ctx: &EnforceCtx<'_>) -> LadderRun {
                     latency_ms: ms,
                     gates: gate_results,
                     verdict,
+                    reflexion_cycle: None,
+                    mentor_correction_hash: None,
+                    reflexion_converged: None,
                 });
                 best = Some((idx as u32, resp));
 
@@ -784,6 +795,9 @@ fn abstain_attempt(rung: u32, model: &str, provider: &str, reason: &str, ms: u64
         latency_ms: ms,
         gates: vec![GateResult::abstain(provider, reason, ms)],
         verdict: Verdict::Abstain,
+        reflexion_cycle: None,
+        mentor_correction_hash: None,
+        reflexion_converged: None,
     }
 }
 

@@ -282,10 +282,7 @@ fn writer_loop(conn: Connection, mut rx: mpsc::Receiver<Trace>, spill: Option<Sp
         drain_spill(&conn, s, &mut head);
     }
 
-    loop {
-        let Some(mut trace) = rx.blocking_recv() else {
-            break;
-        };
+    while let Some(mut trace) = rx.blocking_recv() {
         write_trace(&conn, &mut trace, &mut head);
 
         // Fast-drain: pull any immediately available channel items, then drain spill when
@@ -589,6 +586,9 @@ mod tests {
             latency_ms: 12,
             gates: vec![],
             verdict: Verdict::Pass,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
         };
         let mut trace = Trace {
             trace_id: uuid::Uuid::now_v7(),
@@ -620,6 +620,11 @@ mod tests {
                 counterfactual_baseline_usd: 0.001,
                 savings_usd: 0.0,
                 cache_source: None,
+                reflexion_cycles: None,
+                mentor_cost_usd: None,
+                reflexion_cycles_to_pass: None,
+                triggered_by_self_verify: None,
+                reflexion_latency_capped: None,
             },
             probe: None,
             rollout: None,
