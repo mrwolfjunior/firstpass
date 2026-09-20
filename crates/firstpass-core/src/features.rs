@@ -187,6 +187,9 @@ pub struct Features {
     /// Calling subagent identity, when known (e.g. `"test-runner"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
+    /// Calling subagent name, when known. Wire name: `subagent_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_name: Option<String>,
     /// Coarse bucket of the prompt's token count (see [`token_bucket`]) — never the raw count.
     pub prompt_token_bucket: u32,
     /// Number of tools/functions offered in the request.
@@ -237,6 +240,7 @@ impl Features {
             language: None,
             agent: None,
             subagent: None,
+            subagent_name: None,
             prompt_token_bucket: 0,
             tool_count: 0,
             has_images: false,
@@ -559,5 +563,24 @@ mod v1_chain_regression {
             s.contains("\"difficulty_hint\":3"),
             "a non-default hint must appear in the receipt: {s}"
         );
+    }
+
+    #[test]
+    fn subagent_name_roundtrip_and_backward_compat() {
+        let mut f = Features::new(TaskKind::CodeEdit);
+        let s = serde_json::to_string(&f).expect("must serialize");
+        assert!(
+            !s.contains("subagent_name"),
+            "subagent_name=None must not be serialized: {s}"
+        );
+
+        f.subagent_name = Some("review-worker".into());
+        let s2 = serde_json::to_string(&f).expect("must serialize");
+        assert!(
+            s2.contains("\"subagent_name\":\"review-worker\""),
+            "subagent_name=Some must be serialized with wire name subagent_name: {s2}"
+        );
+        let back: Features = serde_json::from_str(&s2).expect("must deserialize");
+        assert_eq!(back.subagent_name, Some("review-worker".into()));
     }
 }

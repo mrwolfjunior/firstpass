@@ -273,6 +273,20 @@ pub struct Attempt {
     pub gates: Vec<GateResult>,
     /// The attempt's overall verdict (the aggregate that drove escalate-or-serve).
     pub verdict: Verdict,
+    /// Reflexion cycle index for this attempt. `None` for the first attempt (cycle 0 is implicit
+    /// and kept absent for backward-compat with pre-reflexion traces). `Some(1)` = first retry
+    /// after a mentor correction, `Some(2)` = second retry, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexion_cycle: Option<u32>,
+    /// SHA-256 (hex, first 16 chars) of the mentor correction note that preceded this attempt.
+    /// `None` on the first attempt and on non-reflexion routes. Never the raw text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentor_correction_hash: Option<String>,
+    /// Whether this attempt terminated the reflexion loop due to output convergence
+    /// (normalized edit distance < `convergence_threshold`) rather than gate pass or cycle
+    /// exhaustion. `None` / `false` for all non-convergence terminations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexion_converged: Option<bool>,
 }
 
 /// `skip_serializing_if` helper: keeps zero-valued cache fields out of the canonical JSON, so a
@@ -386,6 +400,26 @@ pub struct FinalOutcome {
     pub cache_source: Option<Uuid>,
     /// `counterfactual_baseline_usd - total_cost_usd` — the savings this decision proves.
     pub savings_usd: f64,
+    /// Number of reflexion cycles completed before the final answer was served.
+    /// `None` when reflexion was not configured — byte-identical to pre-reflexion traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexion_cycles: Option<u32>,
+    /// USD cost of all mentor calls in the reflexion loop, separate from executor cost.
+    /// `None` when reflexion was off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentor_cost_usd: Option<f64>,
+    /// Number of reflection cycles used to reach a Pass verdict.
+    /// `Some(0)` = first attempt passed (no reflection needed).
+    /// `Some(N)` = N mentor corrections were needed.
+    /// `None` = reflexion not configured (backward-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexion_cycles_to_pass: Option<u32>,
+    /// Whether the escalation was triggered by self-verification failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggered_by_self_verify: Option<bool>,
+    /// Whether the reflexion loop was cut short by the wall-clock latency cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexion_latency_capped: Option<bool>,
 }
 
 impl Chained for Trace {
@@ -466,6 +500,9 @@ mod tests {
                     latency_ms: 900,
                     gates: vec![GateResult::deterministic("cargo-test", Verdict::Fail, 3100)],
                     verdict: Verdict::Fail,
+                    reflexion_cycle: None,
+                    mentor_correction_hash: None,
+                    reflexion_converged: None,
                 },
                 Attempt {
                     rung: 1,
@@ -479,6 +516,9 @@ mod tests {
                     latency_ms: 1200,
                     gates: vec![GateResult::deterministic("cargo-test", Verdict::Pass, 2950)],
                     verdict: Verdict::Pass,
+                    reflexion_cycle: None,
+                    mentor_correction_hash: None,
+                    reflexion_converged: None,
                 },
             ],
             deferred: vec![],
@@ -492,6 +532,11 @@ mod tests {
                 counterfactual_baseline_usd: 0.0630,
                 savings_usd: 0.0,
                 cache_source: None,
+                reflexion_cycles: None,
+                mentor_cost_usd: None,
+                reflexion_cycles_to_pass: None,
+                triggered_by_self_verify: None,
+                reflexion_latency_capped: None,
             },
             probe: None,
             rollout: None,
@@ -752,5 +797,130 @@ mod tests {
             verify_chain(&chain, GENESIS_HASH).is_err(),
             "tampered probe must break the chain"
         );
+    }
+
+    // ── Reflexion fields backward-compat ─────────────────────────────────────
+
+    #[test]
+    fn reflexion_fields_absent_when_none_preserves_backward_compat() {
+        // A trace where all reflexion fields are None must serialize with no reflexion keys.
+        // This verifies the hash chain invariant: old auditors can verify new traces.
+        let attempt_json = serde_json::to_string(&Attempt {
+            rung: 0,
+            model: "anthropic/claude-haiku-4-5".into(),
+            provider: "anthropic".into(),
+            in_tokens: 100,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 50,
+            cost_usd: 0.001,
+            latency_ms: 100,
+            gates: vec![],
+            verdict: Verdict::Pass,
+            reflexion_cycle: None,
+            mentor_correction_hash: None,
+            reflexion_converged: None,
+        })
+        .unwrap();
+        assert!(
+            !attempt_json.contains("reflexion"),
+            "reflexion keys must be absent when None: {attempt_json}"
+        );
+        assert!(
+            !attempt_json.contains("mentor_correction"),
+            "mentor_correction_hash must be absent when None: {attempt_json}"
+        );
+
+        let outcome_json = serde_json::to_string(&FinalOutcome {
+            served_rung: Some(0),
+            served_from: ServedFrom::Attempt,
+            total_cost_usd: 0.001,
+            gate_cost_usd: 0.0,
+            total_latency_ms: 100,
+            escalations: 0,
+            counterfactual_baseline_usd: 0.01,
+            cache_source: None,
+            savings_usd: 0.009,
+            reflexion_cycles: None,
+            mentor_cost_usd: None,
+            reflexion_cycles_to_pass: None,
+            triggered_by_self_verify: None,
+            reflexion_latency_capped: None,
+        })
+        .unwrap();
+        assert!(
+            !outcome_json.contains("reflexion"),
+            "reflexion keys must be absent when None: {outcome_json}"
+        );
+        assert!(
+            !outcome_json.contains("mentor_cost"),
+            "mentor_cost_usd must be absent when None: {outcome_json}"
+        );
+        assert!(
+            !outcome_json.contains("triggered_by_self_verify"),
+            "triggered_by_self_verify must be absent when None: {outcome_json}"
+        );
+
+        // Whole sample_trace check: no reflexion keys appear when all are None
+        let trace_json = serde_json::to_string(&sample_trace(GENESIS_HASH, 1)).unwrap();
+        assert!(
+            !trace_json.contains("reflexion"),
+            "sample_trace with None reflexion fields must not contain reflexion: {trace_json}"
+        );
+        assert!(
+            !trace_json.contains("mentor_"),
+            "sample_trace with None reflexion fields must not contain mentor_: {trace_json}"
+        );
+    }
+
+    #[test]
+    fn reflexion_fields_roundtrip_when_present() {
+        let attempt = Attempt {
+            rung: 0,
+            model: "local-30b/qwen2.5-32b".into(),
+            provider: "local-30b".into(),
+            in_tokens: 100,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            out_tokens: 50,
+            cost_usd: 0.0,
+            latency_ms: 200,
+            gates: vec![],
+            verdict: Verdict::Fail,
+            reflexion_cycle: Some(1),
+            mentor_correction_hash: Some("abcdef0123456789".into()),
+            reflexion_converged: Some(false),
+        };
+        let json = serde_json::to_string(&attempt).unwrap();
+        assert!(json.contains("\"reflexion_cycle\":1"));
+        assert!(json.contains("\"mentor_correction_hash\":\"abcdef0123456789\""));
+        assert!(json.contains("\"reflexion_converged\":false"));
+        let deserialized: Attempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(attempt, deserialized);
+
+        let outcome = FinalOutcome {
+            served_rung: Some(0),
+            served_from: ServedFrom::Attempt,
+            total_cost_usd: 0.005,
+            gate_cost_usd: 0.001,
+            total_latency_ms: 500,
+            escalations: 0,
+            counterfactual_baseline_usd: 0.05,
+            cache_source: None,
+            savings_usd: 0.045,
+            reflexion_cycles: Some(2),
+            mentor_cost_usd: Some(0.002),
+            reflexion_cycles_to_pass: Some(2),
+            triggered_by_self_verify: Some(true),
+            reflexion_latency_capped: Some(false),
+        };
+        let out_json = serde_json::to_string(&outcome).unwrap();
+        assert!(out_json.contains("\"reflexion_cycles\":2"));
+        assert!(out_json.contains("\"mentor_cost_usd\":0.002"));
+        assert!(out_json.contains("\"reflexion_cycles_to_pass\":2"));
+        assert!(out_json.contains("\"triggered_by_self_verify\":true"));
+        assert!(out_json.contains("\"reflexion_latency_capped\":false"));
+        let des_outcome: FinalOutcome = serde_json::from_str(&out_json).unwrap();
+        assert_eq!(outcome, des_outcome);
     }
 }

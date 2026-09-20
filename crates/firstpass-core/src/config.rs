@@ -179,6 +179,10 @@ pub struct Config {
     /// a visible behaviour change for real users.
     #[serde(default = "default_guardrail_cooldown")]
     pub guardrail_cooldown_secs: i64,
+    /// Reflexion loop configuration. When present on a route or top-level, gate failures
+    /// trigger a mentor-model reflection instead of immediate ladder escalation.
+    #[serde(default)]
+    pub reflexion: Option<ReflexionConfig>,
     /// User-defined subprocess gates (SPEC §8.1), referenced by `id` from a route's `gates` /
     /// `deferred_gates`. Declared as `[[gate]]` sections in TOML.
     #[serde(rename = "gate", default)]
@@ -412,6 +416,11 @@ pub struct Route {
     /// why `max_usd_per_day` is required rather than defaulted.
     #[serde(default)]
     pub shadow: Option<crate::rollout::Shadow>,
+    /// Reflexion loop for this route. When set, gate failures on the executor rung trigger
+    /// mentor-guided reflection instead of (or before) ladder escalation.
+    /// Absent (the default) = today's behaviour, byte-identical.
+    #[serde(default)]
+    pub reflexion: Option<ReflexionConfig>,
 }
 
 /// Predicate over a request's [`Features`]. Every present field is an AND-constraint; absent
@@ -819,6 +828,101 @@ const fn default_cache_max_entries() -> usize {
     10_000
 }
 
+/// Policy when the reflexion loop ends without a successful gate pass.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflexionExhaustedPolicy {
+    /// Serve the best attempt seen during the loop (default, safe fallback).
+    #[default]
+    ServeBestAttempt,
+    /// Return an error to the caller instead of a partial answer.
+    /// Corresponds to the "Firewall Routing" pattern — blocks unsolvable queries from
+    /// wasting resources on the ladder escalation path.
+    Error,
+}
+
+/// Configuration for the mentor-guided Reflexion Loop.
+///
+/// On gate failure the mentor model reads the full conversation context (fast prefill)
+/// and generates a short targeted correction. The executor retries with the correction
+/// injected as a system-level note. This repeats up to `max_reflections` times before
+/// the request is considered failed.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReflexionConfig {
+    /// The mentor model, as `provider/model` (e.g. `"local-80b/qwen2.5-72b"`).
+    /// Must be registered in `[[provider]]`.
+    pub mentor_model: String,
+    /// Hard cap on reflection cycles per request. Must be in `[1, 5]`; validated at parse.
+    #[serde(default = "default_max_reflections")]
+    pub max_reflections: u32,
+    /// Max tokens the mentor may generate per correction. Lower = faster.
+    #[serde(default = "default_mentor_max_out_tokens")]
+    pub mentor_max_out_tokens: u32,
+    /// System prompt injected into the mentor call. If absent, a built-in default is used.
+    #[serde(default)]
+    pub mentor_system_prompt: Option<String>,
+    /// When true, the correction note is injected as a `user` turn appended to the conversation
+    /// before the executor retries. When false (default), it is injected as a hidden `system`
+    /// message prefix visible only to the executor, not the caller.
+    #[serde(default)]
+    pub inject_as_user_turn: bool,
+    /// Convergence threshold in `[0.0, 1.0)`. If the normalized edit distance between the
+    /// executor's current output and its previous output is below this value, the loop
+    /// terminates early. `0.0` (default) disables convergence detection.
+    #[serde(default)]
+    pub convergence_threshold: f64,
+    /// Hard wall-clock budget for the entire reflexion loop in milliseconds.
+    #[serde(default)]
+    pub max_latency_ms: Option<u64>,
+    /// What to do when the reflexion loop exhausts all cycles without a gate passing.
+    #[serde(default = "default_on_reflexion_exhausted")]
+    pub on_reflexion_exhausted: ReflexionExhaustedPolicy,
+}
+
+const fn default_max_reflections() -> u32 {
+    2
+}
+
+const fn default_mentor_max_out_tokens() -> u32 {
+    200
+}
+
+const fn default_on_reflexion_exhausted() -> ReflexionExhaustedPolicy {
+    ReflexionExhaustedPolicy::ServeBestAttempt
+}
+
+impl ReflexionConfig {
+    /// Validate configuration invariants.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidConfig`] if:
+    /// - `max_reflections` is not in `[1, 5]`
+    /// - `mentor_max_out_tokens` is 0
+    /// - `convergence_threshold` is not in `[0.0, 1.0)`
+    pub fn validate(&self) -> Result<()> {
+        if self.max_reflections == 0 || self.max_reflections > 5 {
+            return Err(Error::InvalidConfig(
+                "reflexion.max_reflections must be in [1, 5]".into(),
+            ));
+        }
+        if self.mentor_max_out_tokens == 0 {
+            return Err(Error::InvalidConfig(
+                "reflexion.mentor_max_out_tokens must be > 0".into(),
+            ));
+        }
+        if !self.convergence_threshold.is_finite()
+            || self.convergence_threshold < 0.0
+            || self.convergence_threshold >= 1.0
+        {
+            return Err(Error::InvalidConfig(
+                "reflexion.convergence_threshold must be in [0.0, 1.0)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Config for the UCB1 start-rung bandit (`firstpass_proxy::bandit::StartRungBandit`).
 ///
 /// Absent (`None`) → start every request at rung 0 (byte-identical to today).
@@ -1026,6 +1130,12 @@ impl Config {
                 sh.validate()
                     .map_err(|e| Error::InvalidConfig(format!("route[{i}]: {e}")))?;
             }
+            if let Some(rx) = &route.reflexion {
+                rx.validate()?;
+            }
+        }
+        if let Some(rx) = &config.reflexion {
+            rx.validate()?;
         }
         if let Some(g) = &config.guardrail {
             g.validate().map_err(Error::InvalidConfig)?;
@@ -2110,5 +2220,85 @@ discount = 0.98
         .unwrap();
         assert!((ok.routes[0].rollout.unwrap().percent - 5.0).abs() < f64::EPSILON);
         assert!(Config::parse(&format!("{base}[route.rollout]\npercent = 140.0\n")).is_err());
+    }
+
+    #[test]
+    fn reflexion_config_parses_defaults_and_custom_values() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
+        let c_none = Config::parse(base).unwrap();
+        assert!(c_none.reflexion.is_none());
+        assert!(c_none.routes[0].reflexion.is_none());
+
+        // Minimal route.reflexion (only mentor_model) -> checks defaults
+        let minimal =
+            format!("{base}[route.reflexion]\nmentor_model = \"local-80b/qwen2.5-72b\"\n");
+        let c_min = Config::parse(&minimal).unwrap();
+        let rx = c_min.routes[0].reflexion.as_ref().unwrap();
+        assert_eq!(rx.mentor_model, "local-80b/qwen2.5-72b");
+        assert_eq!(rx.max_reflections, 2);
+        assert_eq!(rx.mentor_max_out_tokens, 200);
+        assert!(rx.mentor_system_prompt.is_none());
+        assert!(!rx.inject_as_user_turn);
+        assert!((rx.convergence_threshold - 0.0).abs() < f64::EPSILON);
+        assert!(rx.max_latency_ms.is_none());
+        assert_eq!(
+            rx.on_reflexion_exhausted,
+            ReflexionExhaustedPolicy::ServeBestAttempt
+        );
+
+        // Custom route.reflexion
+        let custom = format!(
+            "{base}[route.reflexion]\n\
+             mentor_model = \"local-80b/qwen2.5-72b\"\n\
+             max_reflections = 3\n\
+             mentor_max_out_tokens = 150\n\
+             mentor_system_prompt = \"Diagnose and suggest\"\n\
+             inject_as_user_turn = true\n\
+             convergence_threshold = 0.05\n\
+             max_latency_ms = 90000\n\
+             on_reflexion_exhausted = \"error\"\n"
+        );
+        let c_cust = Config::parse(&custom).unwrap();
+        let rx_cust = c_cust.routes[0].reflexion.as_ref().unwrap();
+        assert_eq!(rx_cust.max_reflections, 3);
+        assert_eq!(rx_cust.mentor_max_out_tokens, 150);
+        assert_eq!(
+            rx_cust.mentor_system_prompt.as_deref(),
+            Some("Diagnose and suggest")
+        );
+        assert!(rx_cust.inject_as_user_turn);
+        assert!((rx_cust.convergence_threshold - 0.05).abs() < f64::EPSILON);
+        assert_eq!(rx_cust.max_latency_ms, Some(90_000));
+        assert_eq!(
+            rx_cust.on_reflexion_exhausted,
+            ReflexionExhaustedPolicy::Error
+        );
+
+        // Top-level [reflexion]
+        let top_level = format!("{base}[reflexion]\nmentor_model = \"local-80b/qwen2.5-72b\"\n");
+        let c_top = Config::parse(&top_level).unwrap();
+        assert!(c_top.reflexion.is_some());
+    }
+
+    #[test]
+    fn reflexion_config_validates_invariants() {
+        let base = "[[route]]\nmatch = {}\nmode = \"enforce\"\nladder = [\"anthropic/claude-haiku-4-5\"]\n";
+        for bad in [
+            "mentor_model = \"local-80b/qwen2.5-72b\"\nmax_reflections = 0",
+            "mentor_model = \"local-80b/qwen2.5-72b\"\nmax_reflections = 6",
+            "mentor_model = \"local-80b/qwen2.5-72b\"\nmentor_max_out_tokens = 0",
+            "mentor_model = \"local-80b/qwen2.5-72b\"\nconvergence_threshold = -0.01",
+            "mentor_model = \"local-80b/qwen2.5-72b\"\nconvergence_threshold = 1.0",
+            "mentor_model = \"local-80b/qwen2.5-72b\"\nconvergence_threshold = 1.5",
+        ] {
+            assert!(
+                Config::parse(&format!("{base}[route.reflexion]\n{bad}\n")).is_err(),
+                "invalid reflexion config accepted: {bad}"
+            );
+            assert!(
+                Config::parse(&format!("{base}[reflexion]\n{bad}\n")).is_err(),
+                "invalid top-level reflexion config accepted: {bad}"
+            );
+        }
     }
 }
