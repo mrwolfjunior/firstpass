@@ -252,6 +252,7 @@ pub async fn run_reflexion_loop(ctx: &ReflexionCtx<'_>) -> ReflexionRun {
     let mut latency_capped = false;
     let mut latest_correction: Option<String> = None;
     let mut pending_mentor_correction_hash: Option<String> = None;
+    let mut prev_output: Option<String> = None;
 
     let executor_provider = match ModelRef::parse(ctx.executor_model) {
         Ok(m) => ctx.providers.get(&m.provider),
@@ -371,41 +372,40 @@ pub async fn run_reflexion_loop(ctx: &ReflexionCtx<'_>) -> ReflexionRun {
             .unwrap_or(0.0);
         executor_cost_usd += model_cost;
 
-        // Convergence check (cycle >= 1 only, after getting executor response)
+        // Convergence check: compare against PREVIOUS CYCLE's output (not best)
         if cycle >= 1
             && ctx.config.convergence_threshold > 0.0
-            && let Some((_, ref prev_resp)) = best
+            && let Some(ref prev) = prev_output
+            && normalized_edit_distance(prev, &resp.text) < ctx.config.convergence_threshold
         {
-            let dist = normalized_edit_distance(&prev_resp.text, &resp.text);
-            if dist < ctx.config.convergence_threshold {
-                tracing::info!(
-                    cycle,
-                    dist,
-                    threshold = ctx.config.convergence_threshold,
-                    "reflexion: convergence detected — stopping loop early"
-                );
-                converged = true;
-                let attempt_idx = attempts.len();
-                attempts.push(Attempt {
-                    rung: ctx.executor_rung,
-                    model: ctx.executor_model.to_owned(),
-                    provider: executor_provider.id().to_owned(),
-                    in_tokens: resp.in_tokens,
-                    cache_write_tokens: resp.cache_write_tokens,
-                    cache_read_tokens: resp.cache_read_tokens,
-                    out_tokens: resp.out_tokens,
-                    cost_usd: model_cost,
-                    latency_ms: ms,
-                    gates: vec![],
-                    verdict: Verdict::Abstain,
-                    reflexion_cycle: Some(cycle),
-                    mentor_correction_hash: pending_mentor_correction_hash.take(),
-                    reflexion_converged: Some(true),
-                });
-                best = Some((attempt_idx, resp));
-                break;
-            }
+            tracing::info!(
+                cycle,
+                threshold = ctx.config.convergence_threshold,
+                "reflexion: convergence detected — stopping loop early"
+            );
+            converged = true;
+            attempts.push(Attempt {
+                rung: ctx.executor_rung,
+                model: ctx.executor_model.to_owned(),
+                provider: executor_provider.id().to_owned(),
+                in_tokens: resp.in_tokens,
+                cache_write_tokens: resp.cache_write_tokens,
+                cache_read_tokens: resp.cache_read_tokens,
+                out_tokens: resp.out_tokens,
+                cost_usd: model_cost,
+                latency_ms: ms,
+                gates: vec![],
+                verdict: Verdict::Abstain,
+                reflexion_cycle: Some(cycle),
+                mentor_correction_hash: pending_mentor_correction_hash.take(),
+                reflexion_converged: Some(true),
+            });
+            // Do NOT update best — keep the previous best attempt
+            break;
         }
+
+        // Update prev_output EVERY cycle regardless of verdict
+        prev_output = Some(resp.text.clone());
 
         // Evaluate gates
         let mut gate_results: Vec<GateResult> = Vec::with_capacity(ctx.gates.len());
@@ -631,12 +631,12 @@ mod tests {
     // ── 6. hash_correction_sha256_is_stable ──────────────────────────────────
     #[test]
     fn hash_correction_sha256_is_stable() {
-        let h1 = hash_correction_sha256("hello");
-        let h2 = hash_correction_sha256("hello");
-        assert_eq!(h1.len(), 16, "must be exactly 16 hex chars");
-        assert_eq!(h1, h2, "hash must be deterministic and stable");
-        let h3 = hash_correction_sha256("different");
-        assert_ne!(h1, h3, "different inputs must produce different hashes");
+        let h = hash_correction_sha256("hello");
+        // SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        // First 16 hex chars:
+        assert_eq!(h, "2cf24dba5fb0a30e");
+        // Calling again must return the same value (no randomness).
+        assert_eq!(hash_correction_sha256("hello"), "2cf24dba5fb0a30e");
     }
 
     // ── 7. normalized_edit_distance_identical ────────────────────────────────
@@ -671,38 +671,69 @@ mod tests {
     // ── 10. context_isolation_inject_uses_base_not_accumulated ───────────────
     #[test]
     fn context_isolation_inject_uses_base_not_accumulated() {
+        // Build a base request with one user message.
         let base = make_test_request();
-        let req1 = inject_correction(&base, "correction_1", false);
-        let req2 = inject_correction(&base, "correction_2", false);
 
-        let sys1 = req1.system.as_deref().unwrap_or("");
-        assert!(sys1.contains("correction_1"));
-        assert!(!sys1.contains("correction_2"));
+        // Inject correction_1 -> req_1 (system prefix mode)
+        let req_1 = inject_correction(&base, "correction_1", false);
+        // Inject correction_2 -> req_2 from the SAME base (not from req_1)
+        let req_2 = inject_correction(&base, "correction_2", false);
 
-        let sys2 = req2.system.as_deref().unwrap_or("");
-        assert!(sys2.contains("correction_2"));
-        assert!(!sys2.contains("correction_1"));
-
-        // User turn version
-        let req_u1 = inject_correction(&base, "correction_u1", true);
-        let req_u2 = inject_correction(&base, "correction_u2", true);
-        assert_eq!(req_u1.messages.len(), base.messages.len() + 1);
-        assert_eq!(req_u2.messages.len(), base.messages.len() + 1);
+        // req_1 must contain correction_1 and NOT correction_2 in system prompt
+        let sys_1 = req_1.system.as_deref().unwrap_or("");
         assert!(
-            req_u1
-                .messages
-                .last()
-                .unwrap()
-                .text_view()
-                .contains("correction_u1")
+            sys_1.contains("correction_1"),
+            "req_1 must contain correction_1"
         );
         assert!(
-            !req_u1
-                .messages
-                .last()
-                .unwrap()
-                .text_view()
-                .contains("correction_u2")
+            !sys_1.contains("correction_2"),
+            "req_1 must NOT contain correction_2"
+        );
+
+        // req_2 must contain correction_2 and NOT correction_1 in system prompt
+        let sys_2 = req_2.system.as_deref().unwrap_or("");
+        assert!(
+            sys_2.contains("correction_2"),
+            "req_2 must contain correction_2"
+        );
+        assert!(
+            !sys_2.contains("correction_1"),
+            "req_2 must NOT contain correction_1"
+        );
+
+        // The base must be unchanged
+        let base_sys = base.system.as_deref().unwrap_or("");
+        assert!(
+            !base_sys.contains("correction_1"),
+            "base must not be mutated"
+        );
+        assert!(
+            !base_sys.contains("correction_2"),
+            "base must not be mutated"
+        );
+
+        // Same for user-turn mode
+        let req_u1 = inject_correction(&base, "correction_u1", true);
+        let req_u2 = inject_correction(&base, "correction_u2", true);
+        let ru1 = format!("{:?}", req_u1.messages);
+        let ru2 = format!("{:?}", req_u2.messages);
+        assert!(
+            ru1.contains("correction_u1") && !ru1.contains("correction_u2"),
+            "req_u1 must contain correction_u1 and NOT correction_u2"
+        );
+        assert!(
+            ru2.contains("correction_u2") && !ru2.contains("correction_u1"),
+            "req_u2 must contain correction_u2 and NOT correction_u1"
+        );
+
+        let base_msgs = format!("{:?}", base.messages);
+        assert!(
+            !base_msgs.contains("correction_u1"),
+            "base must not be mutated"
+        );
+        assert!(
+            !base_msgs.contains("correction_u2"),
+            "base must not be mutated"
         );
     }
 
@@ -835,6 +866,82 @@ mod tests {
             "expected initial attempt + 1 converged retry"
         );
         assert_eq!(run.attempts[1].reflexion_converged, Some(true));
+        // best must remain the earlier valid attempt (attempt 0), not overwritten by the converged attempt
+        assert_eq!(run.best.as_ref().map(|(idx, _)| *idx), Some(0));
+    }
+
+    // ── Extra: convergence compares against immediately preceding cycle ──────
+    #[tokio::test]
+    async fn convergence_compares_against_immediately_preceding_cycle() {
+        let config = firstpass_core::config::ReflexionConfig {
+            mentor_model: "mentor/m".to_owned(),
+            max_reflections: 3,
+            mentor_max_out_tokens: 200,
+            mentor_system_prompt: None,
+            inject_as_user_turn: false,
+            convergence_threshold: 0.01,
+            max_latency_ms: None,
+            on_reflexion_exhausted:
+                firstpass_core::config::ReflexionExhaustedPolicy::ServeBestAttempt,
+        };
+
+        // Cycle 0: "output A"
+        // Cycle 1: "output B" (different from A, does not converge)
+        // Cycle 2: "output B" (identical to cycle 1 -> converges!)
+        let executor = Arc::new(MockTestProvider::new(
+            "mock-exec",
+            vec![
+                make_test_response("output A"),
+                make_test_response("output B"),
+                make_test_response("output B"),
+            ],
+        ));
+        let mentor = Arc::new(MockTestProvider::new(
+            "mentor",
+            vec![
+                make_test_response(r#"{"correction": "try something else"}"#),
+                make_test_response(r#"{"correction": "try again"}"#),
+            ],
+        ));
+
+        let mut providers_map: HashMap<String, Arc<dyn crate::provider::Provider>> = HashMap::new();
+        providers_map.insert("mock-exec".to_owned(), executor);
+        providers_map.insert("mentor".to_owned(), mentor);
+        let providers = ProviderRegistry::from_map(providers_map);
+
+        let gate: Box<dyn Gate + Send + Sync> = Box::new(MockTestGate {
+            id: "failing-gate".to_owned(),
+            verdict: Verdict::Fail,
+        });
+        let gates = vec![gate];
+        let health = GateHealthRegistry::new();
+        let base_req = make_test_request();
+        let prices = make_test_prices();
+
+        let ctx = ReflexionCtx {
+            config: &config,
+            executor_rung: 0,
+            executor_model: "mock-exec/m",
+            gates: &gates,
+            health: &health,
+            base_request: &base_req,
+            providers: &providers,
+            auth: None,
+            prices: &prices,
+            tenant_id: "test-tenant",
+            serve_threshold: None,
+        };
+
+        let run = run_reflexion_loop(&ctx).await;
+        assert!(run.converged, "expected loop to converge on cycle 2");
+        assert_eq!(
+            run.attempts.len(),
+            3,
+            "expected 2 normal attempts + 1 converged attempt"
+        );
+        assert_eq!(run.attempts[2].reflexion_converged, Some(true));
+        // best should not be the unverified converged attempt 2
+        assert_ne!(run.best.as_ref().map(|(idx, _)| *idx), Some(2));
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
