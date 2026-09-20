@@ -69,6 +69,8 @@ pub struct ContextBucket {
     pub task_kind: TaskKind,
     /// `features.prompt_token_bucket / 2` — halved for denser arms.
     pub prompt_bucket_coarse: u32,
+    /// Calling subagent name, when known.
+    pub subagent_name: Option<String>,
 }
 
 impl ContextBucket {
@@ -78,6 +80,7 @@ impl ContextBucket {
         Self {
             task_kind: f.task_kind,
             prompt_bucket_coarse: f.prompt_token_bucket / 2,
+            subagent_name: f.subagent_name.clone(),
         }
     }
 
@@ -300,16 +303,31 @@ impl StartRungBandit {
     ///
     /// `Abstain` is ignored — only clear Pass/Fail outcomes are informative for cost modelling.
     pub fn observe(&mut self, ctx: &ContextBucket, rung: u32, verdict: Verdict) {
+        self.observe_with_cycles(ctx, rung, verdict, 0);
+    }
+
+    /// Record a gate verdict for `(context, rung)` with reflexion cycle discounting.
+    ///
+    /// If `verdict == Verdict::Pass`, the reward is discounted by `1.0 / (1.0 + reflexion_cycles as f64)`.
+    /// If `reflexion_cycles == 0`, it behaves identically to `observe`.
+    pub fn observe_with_cycles(
+        &mut self,
+        ctx: &ContextBucket,
+        rung: u32,
+        verdict: Verdict,
+        reflexion_cycles: u32,
+    ) {
         match verdict {
             Verdict::Abstain => {} // not counted
             Verdict::Pass => {
+                let discount = 1.0 / (1.0 + reflexion_cycles as f64);
                 self.discount_context(ctx);
                 self.data
                     .entry(ctx.clone())
                     .or_default()
                     .entry(rung)
                     .or_default()
-                    .pass += 1.0;
+                    .pass += discount;
             }
             Verdict::Fail => {
                 self.discount_context(ctx);
@@ -477,6 +495,7 @@ mod tests {
         ContextBucket {
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: 3,
+            subagent_name: None,
         }
     }
 
@@ -484,6 +503,7 @@ mod tests {
         ContextBucket {
             task_kind: TaskKind::Chat,
             prompt_bucket_coarse: 3,
+            subagent_name: None,
         }
     }
 
@@ -869,6 +889,7 @@ mod tests {
                 ContextBucket {
                     task_kind: TaskKind::CodeEdit,
                     prompt_bucket_coarse: b,
+                    subagent_name: None,
                 }
                 .representative_prompt_tokens()
             })
@@ -881,6 +902,7 @@ mod tests {
         let huge = ContextBucket {
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: u32::MAX,
+            subagent_name: None,
         };
         assert!(huge.representative_prompt_tokens() <= 1 << 20);
     }
@@ -907,10 +929,12 @@ mod tests {
         let c_small = ContextBucket {
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: 1,
+            subagent_name: None,
         };
         let c_large = ContextBucket {
             task_kind: TaskKind::CodeEdit,
             prompt_bucket_coarse: 8,
+            subagent_name: None,
         };
         for _ in 0..10 {
             small.observe(&c_small, 0, Verdict::Fail);
@@ -928,5 +952,48 @@ mod tests {
             c_large.representative_prompt_tokens() > c_small.representative_prompt_tokens() * 8,
             "the large context must price the same ladder materially higher"
         );
+    }
+
+    #[test]
+    fn assisted_pass_is_discounted_vs_unassisted_pass() {
+        let mut b_unassisted = StartRungBandit::new(4, 0.0);
+        let mut b_assisted = StartRungBandit::new(4, 0.0);
+        let ctx = ctx_code();
+
+        // 1 unassisted pass gives +1.0 pass count
+        b_unassisted.observe(&ctx, 0, Verdict::Pass);
+
+        // 1 assisted pass with 2 reflexion cycles gives +1.0 / (1.0 + 2) = +0.333333 pass count
+        b_assisted.observe_with_cycles(&ctx, 0, Verdict::Pass, 2);
+
+        let arm_unassisted = b_unassisted.data.get(&ctx).unwrap().get(&0).unwrap();
+        let arm_assisted = b_assisted.data.get(&ctx).unwrap().get(&0).unwrap();
+
+        assert_eq!(arm_unassisted.pass, 1.0);
+        assert!((arm_assisted.pass - (1.0 / 3.0)).abs() < 1e-6);
+
+        // 0 reflexion cycles is identical to observe
+        let mut b_zero = StartRungBandit::new(4, 0.0);
+        b_zero.observe_with_cycles(&ctx, 0, Verdict::Pass, 0);
+        let arm_zero = b_zero.data.get(&ctx).unwrap().get(&0).unwrap();
+        assert_eq!(arm_zero.pass, 1.0);
+    }
+
+    #[test]
+    fn context_bucket_distinguishes_subagent_names() {
+        let mut f1 = Features::new(TaskKind::CodeEdit);
+        f1.prompt_token_bucket = 6;
+        f1.subagent_name = Some("planner".to_owned());
+
+        let mut f2 = Features::new(TaskKind::CodeEdit);
+        f2.prompt_token_bucket = 6;
+        f2.subagent_name = Some("reviewer".to_owned());
+
+        let b1 = ContextBucket::from_features(&f1);
+        let b2 = ContextBucket::from_features(&f2);
+
+        assert_ne!(b1, b2, "different subagents must map to distinct buckets");
+        assert_eq!(b1.subagent_name.as_deref(), Some("planner"));
+        assert_eq!(b2.subagent_name.as_deref(), Some("reviewer"));
     }
 }

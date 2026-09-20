@@ -1109,6 +1109,7 @@ async fn evaluate_shadow(
         .is_some_and(|r| r.escalation.prompt_cache);
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
+        reflexion: route.reflexion.as_ref(),
         ladder: &route.ladder,
         gates: &gates,
         health: &state.gate_health,
@@ -1628,6 +1629,8 @@ fn extract_features(headers: &HeaderMap, body: &[u8]) -> Features {
     let mut f = Features::new(TaskKind::Other);
     f.agent = header_str(headers, AGENT_HEADER);
     f.subagent = header_str(headers, SUBAGENT_HEADER);
+    f.subagent_name =
+        header_str(headers, "x-firstpass-subagent-name").or_else(|| f.subagent.clone());
     f.tool_count = tool_count;
     f.has_images = has_images;
     // Pre-call we don't know the token count, so bucket by request byte size — a coarse,
@@ -1929,6 +1932,7 @@ async fn enforce_pipeline_inner(
         .is_some_and(|r| r.escalation.prompt_cache);
     let ctx = EnforceCtx {
         condense: routing_cfg_condense(state),
+        reflexion: route.reflexion.as_ref(),
         ladder: &route.ladder,
         gates: &gates,
         health: &state.gate_health,
@@ -1997,7 +2001,12 @@ async fn enforce_pipeline_inner(
         && let Ok(mut b) = bandit.lock()
     {
         for attempt in &trace.attempts {
-            b.observe(&bandit_ctx, attempt.rung, attempt.verdict);
+            b.observe_with_cycles(
+                &bandit_ctx,
+                attempt.rung,
+                attempt.verdict,
+                trace.final_.reflexion_cycles.unwrap_or(0),
+            );
         }
     }
 
@@ -3085,6 +3094,8 @@ fn extract_openai_features(headers: &HeaderMap, body: &[u8]) -> Features {
     let mut f = Features::new(TaskKind::Other);
     f.agent = header_str(headers, AGENT_HEADER);
     f.subagent = header_str(headers, SUBAGENT_HEADER);
+    f.subagent_name =
+        header_str(headers, "x-firstpass-subagent-name").or_else(|| f.subagent.clone());
     f.tool_count = tool_count;
     f.has_images = has_images;
     f.prompt_token_bucket = token_bucket(body.len() as u64);

@@ -43,7 +43,7 @@ pub struct ReflexionCtx<'a> {
     pub config: &'a ReflexionConfig,
     pub executor_rung: u32,
     pub executor_model: &'a str,
-    pub gates: &'a [Box<dyn Gate + Send + Sync>],
+    pub gates: &'a [Box<dyn Gate>],
     pub health: &'a GateHealthRegistry,
     pub base_request: &'a ModelRequest, // NEVER mutate this
     pub providers: &'a ProviderRegistry,
@@ -766,7 +766,7 @@ mod tests {
         providers_map.insert("mentor".to_owned(), mentor);
         let providers = ProviderRegistry::from_map(providers_map);
 
-        let gate: Box<dyn Gate + Send + Sync> = Box::new(MockTestGate {
+        let gate: Box<dyn Gate> = Box::new(MockTestGate {
             id: "failing-gate".to_owned(),
             verdict: Verdict::Fail,
         });
@@ -831,7 +831,7 @@ mod tests {
         providers_map.insert("mentor".to_owned(), mentor);
         let providers = ProviderRegistry::from_map(providers_map);
 
-        let gate: Box<dyn Gate + Send + Sync> = Box::new(MockTestGate {
+        let gate: Box<dyn Gate> = Box::new(MockTestGate {
             id: "failing-gate".to_owned(),
             verdict: Verdict::Fail,
         });
@@ -909,7 +909,7 @@ mod tests {
         providers_map.insert("mentor".to_owned(), mentor);
         let providers = ProviderRegistry::from_map(providers_map);
 
-        let gate: Box<dyn Gate + Send + Sync> = Box::new(MockTestGate {
+        let gate: Box<dyn Gate> = Box::new(MockTestGate {
             id: "failing-gate".to_owned(),
             verdict: Verdict::Fail,
         });

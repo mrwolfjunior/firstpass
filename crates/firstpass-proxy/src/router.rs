@@ -37,6 +37,8 @@ pub struct EnforceCtx<'a> {
     /// Last-resort context condensing. `None` (default) = a prompt that overflows every rung's
     /// window fails, which is today's behaviour. Never fires while a taller rung remains.
     pub condense: Option<&'a firstpass_core::config::CondenseConfig>,
+    /// Reflexion config for this route. `None` = today's behaviour, byte-identical.
+    pub reflexion: Option<&'a firstpass_core::config::ReflexionConfig>,
     /// Model ladder, cheapest first, as `provider/model` strings.
     pub ladder: &'a [String],
     /// Gates run against each attempt's output (already resolved).
@@ -100,12 +102,17 @@ pub struct EnforceCtx<'a> {
 /// Lives above the engine choice rather than inside one of them, because a feature that silently
 /// does nothing under speculation is worse than one that is absent — the config would read as
 /// enabled and the receipts would show requests failing anyway.
-async fn run_ladder(ctx: &EnforceCtx<'_>) -> LadderRun {
-    let run = if ctx.speculation == 0 {
+async fn run_ladder(ctx: &EnforceCtx<'_>, mut pre_attempts: Vec<Attempt>) -> LadderRun {
+    let mut run = if ctx.speculation == 0 {
         run_serial(ctx).await
     } else {
         run_speculative(ctx).await
     };
+
+    if !pre_attempts.is_empty() {
+        pre_attempts.append(&mut run.attempts);
+        run.attempts = pre_attempts;
+    }
 
     // Every rung overflowed and nothing was served. The ladder is exhausted, so the choice is no
     // longer "faithful answer vs degraded answer" — it is "degraded answer vs no answer".
@@ -132,6 +139,7 @@ async fn run_ladder(ctx: &EnforceCtx<'_>) -> LadderRun {
     );
     let retry_ctx = EnforceCtx {
         condense: None,
+        reflexion: None,
         base_request: &c.request,
         features: ctx.features.clone(),
         tenant_id: ctx.tenant_id.clone(),
@@ -153,7 +161,7 @@ async fn run_ladder(ctx: &EnforceCtx<'_>) -> LadderRun {
         // Retry on the rung with the largest window.
         start_rung: (ctx.ladder.len().saturating_sub(1)) as u32,
     };
-    let mut retry = Box::pin(run_ladder(&retry_ctx)).await;
+    let mut retry = Box::pin(run_ladder(&retry_ctx, vec![])).await;
     // Keep the overflow attempts on the receipt: they are WHY the answer is condensed, and a
     // record that hid them would show a served response with no explanation for the elision.
     let mut merged = run.attempts;
@@ -170,6 +178,207 @@ async fn run_ladder(ctx: &EnforceCtx<'_>) -> LadderRun {
 }
 
 pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
+    // ── Reflexion loop (optional pre-pass) ────────────────────────────────────
+    let (
+        pre_attempts,
+        rx_cycles,
+        rx_mentor_cost,
+        rx_executor_cost,
+        rx_gate_cost,
+        rx_latency_capped,
+        rx_self_verify,
+    ) = if let Some(rx_cfg) = ctx.reflexion
+        && !ctx.ladder.is_empty()
+    {
+        let executor_rung = ctx.start_rung;
+        let executor_model = ctx
+            .ladder
+            .get(executor_rung as usize)
+            .map(String::as_str)
+            .unwrap_or("");
+
+        let rx_ctx = crate::reflexion::ReflexionCtx {
+            config: rx_cfg,
+            executor_rung,
+            executor_model,
+            gates: ctx.gates,
+            health: ctx.health,
+            base_request: ctx.base_request,
+            providers: ctx.providers,
+            auth: Some(ctx.auth),
+            prices: ctx.prices,
+            tenant_id: &ctx.tenant_id,
+            serve_threshold: ctx.serve_threshold,
+        };
+
+        let run = crate::reflexion::run_reflexion_loop(&rx_ctx).await;
+
+        let self_verify_triggered = if run.attempts.iter().any(|a| {
+            a.gates
+                .iter()
+                .any(|g| g.reason.as_deref() == Some("self_verify_rejected"))
+        }) {
+            Some(true)
+        } else {
+            None
+        };
+
+        if run.served_rung.is_some() {
+            // Reflexion passed: short-circuit, do not call run_ladder.
+            let total_latency_ms = run.attempts.iter().map(|a| a.latency_ms).sum();
+            let top_model = ctx.ladder.last().map(String::as_str).unwrap_or_default();
+            let served_tokens = run
+                .best
+                .as_ref()
+                .map(|(_, r)| (r.in_tokens, r.out_tokens))
+                .unwrap_or((0, 0));
+            let total_cost = run.executor_cost_usd + run.mentor_cost_usd;
+            let baseline = ctx
+                .prices
+                .cost_usd(top_model, served_tokens.0, served_tokens.1)
+                .unwrap_or(total_cost);
+            let outcome = run
+                .best
+                .as_ref()
+                .map(|(_, r)| EngineOutcome::Served(r.clone()))
+                .unwrap_or_else(|| EngineOutcome::Failed("reflexion: no output".into()));
+            let cycles_to_pass = Some(run.cycles_completed);
+
+            let mut trace = Trace {
+                trace_id: Uuid::now_v7(),
+                prev_hash: GENESIS_HASH.to_owned(),
+                tenant_id: ctx.tenant_id,
+                session_id: ctx.session_id,
+                ts: Timestamp::now(),
+                mode: Mode::Enforce,
+                policy: PolicyRef {
+                    id: ctx.policy_id,
+                    explore: false,
+                    propensity: None,
+                    mode_profile: None,
+                },
+                request: RequestInfo {
+                    api: ctx.api,
+                    prompt_hash: ctx.prompt_hash,
+                    features: ctx.features,
+                },
+                attempts: run.attempts,
+                deferred: vec![],
+                final_: FinalOutcome {
+                    served_rung: run.served_rung,
+                    served_from: ServedFrom::Attempt,
+                    total_cost_usd: total_cost,
+                    gate_cost_usd: run.gate_cost_total,
+                    total_latency_ms,
+                    escalations: 0,
+                    counterfactual_baseline_usd: baseline,
+                    savings_usd: 0.0,
+                    cache_source: None,
+                    reflexion_cycles: if run.cycles_completed > 0 {
+                        Some(run.cycles_completed)
+                    } else {
+                        None
+                    },
+                    mentor_cost_usd: if run.mentor_cost_usd > 0.0 {
+                        Some(run.mentor_cost_usd)
+                    } else {
+                        None
+                    },
+                    reflexion_cycles_to_pass: cycles_to_pass,
+                    triggered_by_self_verify: self_verify_triggered,
+                    reflexion_latency_capped: if run.latency_capped { Some(true) } else { None },
+                },
+                probe: None,
+                rollout: None,
+                shadow: None,
+                route_ix: None,
+                predicted_pass: None,
+                elastic: None,
+            };
+            trace.recompute_savings();
+            return (outcome, trace);
+        }
+
+        // Fallback path: run.served_rung.is_none()
+        match rx_cfg.on_reflexion_exhausted {
+            firstpass_core::config::ReflexionExhaustedPolicy::Error => {
+                let total_latency_ms = run.attempts.iter().map(|a| a.latency_ms).sum();
+                let total_cost = run.executor_cost_usd + run.mentor_cost_usd;
+                let mut trace = Trace {
+                    trace_id: Uuid::now_v7(),
+                    prev_hash: GENESIS_HASH.to_owned(),
+                    tenant_id: ctx.tenant_id,
+                    session_id: ctx.session_id,
+                    ts: Timestamp::now(),
+                    mode: Mode::Enforce,
+                    policy: PolicyRef {
+                        id: ctx.policy_id,
+                        explore: false,
+                        propensity: None,
+                        mode_profile: None,
+                    },
+                    request: RequestInfo {
+                        api: ctx.api,
+                        prompt_hash: ctx.prompt_hash,
+                        features: ctx.features,
+                    },
+                    attempts: run.attempts,
+                    deferred: vec![],
+                    final_: FinalOutcome {
+                        served_rung: None,
+                        served_from: ServedFrom::Error,
+                        total_cost_usd: total_cost,
+                        gate_cost_usd: run.gate_cost_total,
+                        total_latency_ms,
+                        escalations: 0,
+                        counterfactual_baseline_usd: total_cost,
+                        savings_usd: 0.0,
+                        cache_source: None,
+                        reflexion_cycles: if run.cycles_completed > 0 {
+                            Some(run.cycles_completed)
+                        } else {
+                            None
+                        },
+                        mentor_cost_usd: if run.mentor_cost_usd > 0.0 {
+                            Some(run.mentor_cost_usd)
+                        } else {
+                            None
+                        },
+                        reflexion_cycles_to_pass: None,
+                        triggered_by_self_verify: self_verify_triggered,
+                        reflexion_latency_capped: if run.latency_capped {
+                            Some(true)
+                        } else {
+                            None
+                        },
+                    },
+                    probe: None,
+                    rollout: None,
+                    shadow: None,
+                    route_ix: None,
+                    predicted_pass: None,
+                    elastic: None,
+                };
+                trace.recompute_savings();
+                return (
+                    EngineOutcome::Failed("Reflexion loop exhausted".into()),
+                    trace,
+                );
+            }
+            firstpass_core::config::ReflexionExhaustedPolicy::ServeBestAttempt => (
+                run.attempts,
+                run.cycles_completed,
+                run.mentor_cost_usd,
+                run.executor_cost_usd,
+                run.gate_cost_total,
+                run.latency_capped,
+                self_verify_triggered,
+            ),
+        }
+    } else {
+        (vec![], 0, 0.0, 0.0, 0.0, false, None)
+    };
+
     // Speculation is off by default (serial); the serial path is the original, proven engine, left
     // untouched. Both paths produce the same ladder state; only the tail (serve + trace) is shared.
     let LadderRun {
@@ -180,7 +389,7 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         mut served_rung,
         hard_error,
         elastic,
-    } = run_ladder(&ctx).await;
+    } = run_ladder(&ctx, pre_attempts).await;
 
     // Decide what to serve.
     let (outcome, served_from, served_tokens) = match (served_rung, &best) {
@@ -257,6 +466,20 @@ pub async fn route_enforce(ctx: EnforceCtx<'_>) -> (EngineOutcome, Trace) {
         predicted_pass: None,
         elastic,
     };
+    if rx_cycles > 0 {
+        trace.final_.reflexion_cycles = Some(rx_cycles);
+    }
+    if rx_mentor_cost > 0.0 {
+        trace.final_.mentor_cost_usd = Some(rx_mentor_cost);
+    }
+    if rx_latency_capped {
+        trace.final_.reflexion_latency_capped = Some(true);
+    }
+    if rx_self_verify.is_some() {
+        trace.final_.triggered_by_self_verify = rx_self_verify;
+    }
+    trace.final_.total_cost_usd += rx_executor_cost + rx_mentor_cost;
+    trace.final_.gate_cost_usd += rx_gate_cost;
     trace.recompute_savings();
     (outcome, trace)
 }
@@ -971,6 +1194,7 @@ mod tests {
     ) -> EnforceCtx<'a> {
         EnforceCtx {
             condense: None,
+            reflexion: None,
             ladder,
             gates,
             health,
@@ -2209,5 +2433,216 @@ mod tests {
         let d = trace.elastic.unwrap();
         assert_eq!(d.action, ElasticAction::Verified);
         assert!((d.signal - 0.3).abs() < 1e-9);
+    }
+
+    #[derive(Debug)]
+    struct MockSeqProvider {
+        id: String,
+        responses:
+            std::sync::Mutex<std::collections::VecDeque<Result<ModelResponse, ProviderError>>>,
+    }
+
+    impl MockSeqProvider {
+        fn new(id: impl Into<String>, resps: Vec<Result<ModelResponse, ProviderError>>) -> Self {
+            Self {
+                id: id.into(),
+                responses: std::sync::Mutex::new(resps.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockSeqProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn carries_structured_verbatim(&self, _inbound: firstpass_core::Dialect) -> bool {
+            true
+        }
+        async fn complete(
+            &self,
+            _req: &ModelRequest,
+            _auth: &Auth,
+        ) -> Result<ModelResponse, ProviderError> {
+            let mut queue = self.responses.lock().unwrap();
+            queue
+                .pop_front()
+                .unwrap_or_else(|| Err(ProviderError::Transport("mock queue empty".to_owned())))
+        }
+    }
+
+    #[tokio::test]
+    async fn reflexion_short_circuits_on_pass() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(JsonValidGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+
+        let anthropic_resps = vec![
+            Ok(resp(HAIKU, "not json")),
+            Ok(resp(HAIKU, r#"{"valid": true}"#)),
+        ];
+        let openai_resps = vec![Ok(resp(
+            GPT,
+            r#"{"correction": "please output valid JSON"}"#,
+        ))];
+
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockSeqProvider::new("anthropic", anthropic_resps)),
+        );
+        map.insert(
+            "openai".to_owned(),
+            Arc::new(MockSeqProvider::new("openai", openai_resps)),
+        );
+        let providers = ProviderRegistry::from_map(map);
+
+        let rx_cfg = firstpass_core::config::ReflexionConfig {
+            mentor_model: GPT.to_owned(),
+            max_reflections: 2,
+            mentor_max_out_tokens: 200,
+            mentor_system_prompt: None,
+            inject_as_user_turn: false,
+            convergence_threshold: 0.0,
+            max_latency_ms: None,
+            on_reflexion_exhausted:
+                firstpass_core::config::ReflexionExhaustedPolicy::ServeBestAttempt,
+        };
+
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.reflexion = Some(&rx_cfg);
+
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(
+            matches!(out, EngineOutcome::Served(r) if r.model == HAIKU && r.text.contains("valid"))
+        );
+        assert_eq!(trace.final_.served_rung, Some(0));
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+        assert_eq!(trace.final_.reflexion_cycles, Some(1));
+        assert_eq!(trace.final_.reflexion_cycles_to_pass, Some(1));
+        assert!(trace.final_.mentor_cost_usd.unwrap() > 0.0);
+        assert_eq!(trace.final_.escalations, 0);
+        assert_eq!(trace.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reflexion_exhausted_error_policy_fails_immediately() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(JsonValidGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+
+        let anthropic_resps = vec![Ok(resp(HAIKU, "not json 1")), Ok(resp(HAIKU, "not json 2"))];
+        let openai_resps = vec![Ok(resp(
+            GPT,
+            r#"{"correction": "please output valid JSON"}"#,
+        ))];
+
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockSeqProvider::new("anthropic", anthropic_resps)),
+        );
+        map.insert(
+            "openai".to_owned(),
+            Arc::new(MockSeqProvider::new("openai", openai_resps)),
+        );
+        let providers = ProviderRegistry::from_map(map);
+
+        let rx_cfg = firstpass_core::config::ReflexionConfig {
+            mentor_model: GPT.to_owned(),
+            max_reflections: 1,
+            mentor_max_out_tokens: 200,
+            mentor_system_prompt: None,
+            inject_as_user_turn: false,
+            convergence_threshold: 0.0,
+            max_latency_ms: None,
+            on_reflexion_exhausted: firstpass_core::config::ReflexionExhaustedPolicy::Error,
+        };
+
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.reflexion = Some(&rx_cfg);
+
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(
+            matches!(out, EngineOutcome::Failed(msg) if msg.contains("Reflexion loop exhausted"))
+        );
+        assert_eq!(trace.final_.served_rung, None);
+        assert_eq!(trace.final_.served_from, ServedFrom::Error);
+        assert_eq!(trace.final_.reflexion_cycles, Some(1));
+        assert_eq!(trace.final_.reflexion_cycles_to_pass, None);
+        assert_eq!(trace.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reflexion_exhausted_serve_best_falls_through_to_ladder() {
+        let ladder = vec![HAIKU.to_owned(), SONNET.to_owned()];
+        let gates: Vec<Box<dyn Gate>> = vec![Box::new(JsonValidGate)];
+        let req = base_request();
+        let (auth, prices) = (Auth::default(), PriceTable::defaults());
+        let health = GateHealthRegistry::new();
+
+        // 2 attempts during reflexion loop (both fail)
+        // 1 attempt on ladder rung 0 (fails)
+        // 1 attempt on ladder rung 1 (passes)
+        let anthropic_resps = vec![
+            Ok(resp(HAIKU, "bad json 1")),
+            Ok(resp(HAIKU, "bad json 2")),
+            Ok(resp(HAIKU, "bad json 3")),
+            Ok(resp(SONNET, r#"{"escaped": true}"#)),
+        ];
+        let openai_resps = vec![Ok(resp(
+            GPT,
+            r#"{"correction": "please output valid JSON"}"#,
+        ))];
+
+        let mut map: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        map.insert(
+            "anthropic".to_owned(),
+            Arc::new(MockSeqProvider::new("anthropic", anthropic_resps)),
+        );
+        map.insert(
+            "openai".to_owned(),
+            Arc::new(MockSeqProvider::new("openai", openai_resps)),
+        );
+        let providers = ProviderRegistry::from_map(map);
+
+        let rx_cfg = firstpass_core::config::ReflexionConfig {
+            mentor_model: GPT.to_owned(),
+            max_reflections: 1,
+            mentor_max_out_tokens: 200,
+            mentor_system_prompt: None,
+            inject_as_user_turn: false,
+            convergence_threshold: 0.0,
+            max_latency_ms: None,
+            on_reflexion_exhausted:
+                firstpass_core::config::ReflexionExhaustedPolicy::ServeBestAttempt,
+        };
+
+        let mut c = ctx(
+            &ladder, &gates, &req, &providers, &auth, &prices, None, &health,
+        );
+        c.reflexion = Some(&rx_cfg);
+
+        let (out, trace) = route_enforce(c).await;
+
+        assert!(
+            matches!(out, EngineOutcome::Served(r) if r.model == SONNET && r.text.contains("escaped"))
+        );
+        assert_eq!(trace.final_.served_rung, Some(1));
+        assert_eq!(trace.final_.served_from, ServedFrom::Attempt);
+        assert_eq!(trace.final_.reflexion_cycles, Some(1));
+        assert!(trace.final_.mentor_cost_usd.unwrap() > 0.0);
+        // 2 attempts from reflexion + 2 attempts from ladder = 4 total attempts
+        assert_eq!(trace.attempts.len(), 4);
     }
 }

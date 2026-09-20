@@ -33,6 +33,8 @@
   - `d941faa` fix: SHA-256 pinned, context isolation assertions, convergence prev_output (14 tests)
   - Re-review clean (B1/B2/B3 ADDRESSED, 438 tests workspace)
 - [x] Phase 3 — Self-verification gate — COMPLETE
-- [ ] Phase 4 — Router & proxy integration
-- [ ] Phase 5 — Bandit improvements
+  - `50a4e1ba` gate.rs (34 tests proxy, 10 tests core)
+  - Review: spec ✅, quality Approved (443 tests workspace)
+- [x] Phase 4 — Router & proxy integration — COMPLETE
+- [x] Phase 5 — Bandit improvements — COMPLETE
 - [ ] Phase 6 — Final verification
